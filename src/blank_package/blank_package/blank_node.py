@@ -13,7 +13,7 @@ class DistanceNode(Node):
         super().__init__('distance')
         self.vehicle_name = os.getenv('VEHICLE_NAME')
 
-        self.distance_sub = self.create_subscription(Range, f'/{self.vehicle_name}/distance_sensor', self.check_range, 10)
+        self.distance_sub = self.create_subscription(Range, f'/{self.vehicle_name}/range', self.check_range, 10)
 
     def check_range(self, msg):
         distance = msg.range
