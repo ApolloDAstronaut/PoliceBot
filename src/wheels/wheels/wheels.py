@@ -18,11 +18,14 @@ class TofNode(Node):
 
     def check_range(self, msg):
         distance = msg.range
+        self.get_logger().info("It is working!!!!")
         if distance >= 1.5:
             self.go_left()
+            self.get_logger().info("In the first contition")
         else:
             while(distance > 0.2):
                 self.move_forward()
+                self.get_logger().info("In the secont contition")
             self.stop()
 
     def move_forward(self):
