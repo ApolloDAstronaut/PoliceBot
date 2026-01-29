@@ -60,7 +60,7 @@ def main():
     try:
         rclpy.spin(tof)
     finally:
-        tof.destroy_node()
+        tof.stop()
         rclpy.shutdown()
 
 
