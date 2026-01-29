@@ -157,6 +157,7 @@ class MotionController(Node):
 
     def range_cb(self, msg: Range):
         self.latest_range = msg.range
+        self.get_logger().info(f'Distance: {self.latest_range:.3f}')
 
     def control_loop(self):
         t = self.now()
