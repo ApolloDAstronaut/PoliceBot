@@ -1,4 +1,12 @@
 #!/usr/bin/python3
+import os
+import rclpy
+from rclpy.node import Node
+
+from sensor_msgs.msg import Range
+from duckietown_msgs.msg import WheelsCmdStamped
+
+
 class TofNode(Node):
     def __init__(self):
         super().__init__('tof_node')
@@ -52,8 +60,9 @@ def main():
     try:
         rclpy.spin(tof)
     finally:
-        rclpy.stop()
+        tof.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
