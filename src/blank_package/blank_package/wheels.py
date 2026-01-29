@@ -31,13 +31,15 @@ class ImageColorDetector(Node):
         self.create_subscription(CompressedImage, img_topic, self.image_callback, 10)
         self.pub = self.create_publisher(Bool, pub_topic, 10)
 
+        # detection params
         self.frame_skip = 3
         self.counter = 0
 
         self.grid = 3
-        self.avg_thresh = 0.003
+        self.avg_thresh = 0.003     # VERY sensitive for small red objects
         self.min_pixels = 8
 
+        # debounce
         self.required_hits = 2
         self.hit_count = 0
 
@@ -65,13 +67,15 @@ class ImageColorDetector(Node):
 
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
+        # RED has TWO ranges in HSV
         lower_red1 = np.array([0, 90, 60])
         upper_red1 = np.array([10, 255, 255])
         lower_red2 = np.array([160, 90, 60])
         upper_red2 = np.array([179, 255, 255])
 
-        mask = cv2.inRange(hsv, lower_red1, upper_red1) | \
-               cv2.inRange(hsv, lower_red2, upper_red2)
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        red_mask = mask1 | mask2
 
         tile_h = roi.shape[0] // self.grid
         tile_w = roi.shape[1] // self.grid
@@ -81,7 +85,9 @@ class ImageColorDetector(Node):
 
         for r in range(self.grid):
             for c in range(self.grid):
-                tile = mask[r*tile_h:(r+1)*tile_h, c*tile_w:(c+1)*tile_w]
+                y1 = r * tile_h
+                x1 = c * tile_w
+                tile = red_mask[y1:y1+tile_h, x1:x1+tile_w]
                 if tile.size == 0:
                     continue
 
@@ -94,7 +100,9 @@ class ImageColorDetector(Node):
                 weighted_sum += frac * weight
                 weight_total += weight
 
-        detected = (weighted_sum / max(weight_total, 1e-6)) >= self.avg_thresh
+        avg = weighted_sum / max(weight_total, 1e-6)
+        detected = avg >= self.avg_thresh
+
         self.hit_count = self.hit_count + 1 if detected else 0
 
         out = Bool()
@@ -106,7 +114,7 @@ class ImageColorDetector(Node):
 
 class MotionController(Node):
     """
-    Turns → sees red → approaches (POLICE LIGHTS) → arrived (RED FLASH) → turns → repeats
+    Turns → sees red → approaches → blinks → turns → repeats
     """
 
     def __init__(self):
@@ -120,6 +128,7 @@ class MotionController(Node):
         self.wheels_pub = self.create_publisher(WheelsCmdStamped, f'/{self.vehicle_name}/wheels_cmd', 10)
         self.led_pub = self.create_publisher(LEDPattern, f'/{self.vehicle_name}/led_pattern', 10)
 
+        # motion params (FASTER + STABLE)
         self.scan_speed = (0.45, 0.0)
         self.forward_speed = (0.28, 0.28)
         self.turn_speed = 0.18
@@ -143,6 +152,7 @@ class MotionController(Node):
         if msg.data:
             self.latest_red_time = self.now()
             if self.state == 'SCANNING':
+                self.get_logger().info('Red detected → APPROACHING')
                 self.state = 'APPROACHING'
 
     def range_cb(self, msg: Range):
@@ -153,7 +163,6 @@ class MotionController(Node):
 
         if self.state == 'SCANNING':
             self.publish_wheels(*self.scan_speed)
-            self.publish_led_off()
 
         elif self.state == 'APPROACHING':
             if self.latest_red_time is None or t - self.latest_red_time > self.loss_timeout:
@@ -162,24 +171,17 @@ class MotionController(Node):
 
             self.publish_wheels(*self.forward_speed)
 
-            # 🚓 POLICE LIGHTS (red / blue alternating)
-            if int(t / 0.25) % 2 == 0:
-                self.publish_led_color(1.0, 0.0, 0.0)  # red
-            else:
-                self.publish_led_color(0.0, 0.0, 1.0)  # blue
-
             if self.latest_range is not None and self.latest_range < self.distance_threshold:
+                self.get_logger().info('Arrived → BLINK')
                 self.publish_wheels(0.0, 0.0)
                 self.blink_start = t
                 self.state = 'BLINK'
 
         elif self.state == 'BLINK':
-            # 🔴 FAST RED FLASH
-            on = int((t - self.blink_start) / 0.2) % 2 == 0
-            self.publish_led_color(1.0, 0.0, 0.0) if on else self.publish_led_off()
+            self.publish_led(int((t - self.blink_start) / 0.3) % 2 == 0)
 
             if t - self.blink_start > 1.2:
-                self.publish_led_off()
+                self.publish_led(False)
                 self.turn_end = self.get_clock().now() + Duration(seconds=1.6)
                 self.state = 'TURNING'
 
@@ -198,14 +200,11 @@ class MotionController(Node):
         msg.vel_right = float(r)
         self.wheels_pub.publish(msg)
 
-    def publish_led_color(self, r, g, b):
+    def publish_led(self, on):
         p = LEDPattern()
-        c = ColorRGBA(r=r, g=g, b=b, a=1.0)
+        c = ColorRGBA(r=1.0 if on else 0.0, g=0.0, b=0.0, a=1.0 if on else 0.0)
         p.rgb_vals = [c for _ in range(5)]
         self.led_pub.publish(p)
-
-    def publish_led_off(self):
-        self.publish_led_color(0.0, 0.0, 0.0)
 
 
 # ================= MAIN =================
@@ -226,7 +225,7 @@ def main(args=None):
         pass
     finally:
         motion_node.publish_wheels(0.0, 0.0)
-        motion_node.publish_led_off()
+        motion_node.publish_led(False)
         executor.shutdown()
         image_node.destroy_node()
         motion_node.destroy_node()
