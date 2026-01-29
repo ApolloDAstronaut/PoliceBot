@@ -10,8 +10,9 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('lib/'+package_name,['blank_package/blank_node.py']) #we added this line, add another if more nodes
-    ],
+        ('lib/'+package_name,['blank_package/wheels.py']), #we added this line, add another if more nodes
+        ('lib/'+package_name,['blank_package/distance_sensor.py'])      
+ ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='root',

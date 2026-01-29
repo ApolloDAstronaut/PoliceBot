@@ -14,6 +14,7 @@ class DistanceNode(Node):
         self.vehicle_name = os.getenv('VEHICLE_NAME')
 
         self.distance_sub = self.create_subscription(Range, f'/{self.vehicle_name}/range', self.check_range, 10)
+        self.timer = self.create_timer(1, self.check_range)
 
     def check_range(self, msg):
         distance = msg.range
