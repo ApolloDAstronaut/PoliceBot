@@ -1,4 +1,4 @@
-FROM spgc/duckiebot-base-image:latest
+FROM krinkin/gtl-cy-2026-opencv
 
 SHELL ["/bin/bash", "-c"]
 
