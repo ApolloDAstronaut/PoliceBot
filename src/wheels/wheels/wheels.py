@@ -10,7 +10,6 @@ from duckietown_msgs.msg import WheelsCmdStamped
 
 class TofNode(Node):
     def __init__(self):
-<<<<<<< HEAD
         super().__init__('tof')
         self.vehicle_name = os.getenv('VEHICLE_NAME')
 
@@ -19,11 +18,14 @@ class TofNode(Node):
 
     def check_range(self, msg):
         distance = msg.range
+        self.get_logger().info("It is working!!!!")
         if distance >= 1.5:
             self.go_left()
+            self.get_logger().info("In the first contition")
         else:
             while(distance > 0.2):
                 self.move_forward()
+                self.get_logger().info("In the secont contition")
             self.stop()
 
     def move_forward(self):
@@ -47,52 +49,6 @@ class TofNode(Node):
         wheel_msg.vel_left = vel_left
         wheel_msg.vel_right = vel_right
         self.wheels_pub.publish(wheel_msg)
-=======
-        super().__init__('tof_node')
-
-        self.vehicle_name = os.getenv('VEHICLE_NAME', 'duckiebot')
-
-        self.tof_sub = self.create_subscription(
-            Range,
-            f'/{self.vehicle_name}/range',
-            self.check_range,
-            10
-        )
-
-        self.wheels_pub = self.create_publisher(
-            WheelsCmdStamped,
-            f'/{self.vehicle_name}/wheels_cmd',
-            10
-        )
-
-    def check_range(self, msg):
-        distance = msg.range
-
-        #if distance >= 1.5:
-           #self.go_left()
-        if distance > 1.5:
-            self.move_forward()
-        if distance <= 0.2:
-            self.stop()
-
-    def move_forward(self):
-        self.run_wheels(0.5, 0.5)
-
-    def go_left(self):
-        self.run_wheels(0.5, 0.0)
-
-    def stop(self):
-        self.run_wheels(0.0, 0.0)
-
-    def run_wheels(self, vel_left, vel_right):
-        msg = WheelsCmdStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'
-        msg.vel_left = vel_left
-        msg.vel_right = vel_right
-        self.wheels_pub.publish(msg)
-
->>>>>>> 2414b10d31d551dbc8345c264f1bc3ecfe7dfe2c
 
 def main():
     rclpy.init()
@@ -100,15 +56,7 @@ def main():
     try:
         rclpy.spin(tof)
     finally:
-<<<<<<< HEAD
         rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
-=======
-        rclpy.stop()
-        rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
->>>>>>> 2414b10d31d551dbc8345c264f1bc3ecfe7dfe2c
