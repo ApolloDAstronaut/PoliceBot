@@ -13,42 +13,37 @@ import numpy as np
 import cv2
 
 
-# ============================================================
-# IMAGE NODE — RED DETECTION
-# ============================================================
+# ================= IMAGE DETECTOR =================
+
 class ImageColorDetector(Node):
     """
-    Detect small RED region using grid-averaged detection inside a center ROI.
-    Publishes Bool on /<vehicle>/black_detected (now meaning RED detected).
+    Robust RED detection using HSV + grid + debounce
+    Publishes Bool on /<vehicle>/red_detected
     """
 
     def __init__(self):
         super().__init__('image_color_detector')
 
         self.vehicle_name = os.getenv('VEHICLE_NAME', 'duckiebot').strip()
-        self.img_topic = f'/{self.vehicle_name}/image/compressed'
-        self.pub_topic = f'/{self.vehicle_name}/black_detected'
+        img_topic = f'/{self.vehicle_name}/image/compressed'
+        pub_topic = f'/{self.vehicle_name}/red_detected'
 
-        self.create_subscription(
-            CompressedImage,
-            self.img_topic,
-            self.image_callback,
-            10
-        )
-        self.pub = self.create_publisher(Bool, self.pub_topic, 10)
+        self.create_subscription(CompressedImage, img_topic, self.image_callback, 10)
+        self.pub = self.create_publisher(Bool, pub_topic, 10)
 
-        self.get_logger().info(
-            f'RedDetector subscribing: {self.img_topic}, publishing: {self.pub_topic}'
-        )
-
-        self.frame_skip = 4
+        # detection params
+        self.frame_skip = 3
         self.counter = 0
 
-        # Grid detection parameters
-        self.grid_rows = 3
-        self.grid_cols = 3
-        self.avg_fraction_threshold = 0.005
-        self.per_tile_min_pixels = 12
+        self.grid = 3
+        self.avg_thresh = 0.003     # VERY sensitive for small red objects
+        self.min_pixels = 8
+
+        # debounce
+        self.required_hits = 2
+        self.hit_count = 0
+
+        self.get_logger().info(f'Red detector listening on {img_topic}')
 
     def image_callback(self, msg: CompressedImage):
         if self.counter % self.frame_skip != 0:
@@ -56,83 +51,70 @@ class ImageColorDetector(Node):
             return
         self.counter += 1
 
-        if not msg.data:
-            return
-
         try:
-            arr = np.frombuffer(msg.data, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            img = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 return
         except Exception:
             return
 
         h, w = img.shape[:2]
-
-        # Center ROI (40% x 40%)
         rw, rh = int(w * 0.4), int(h * 0.4)
         cx, cy = w // 2, h // 2
-        x1, y1 = max(0, cx - rw // 2), max(0, cy - rh // 2)
-        x2, y2 = min(w, x1 + rw), min(h, y1 + rh)
-        roi = img[y1:y2, x1:x2]
-
+        roi = img[cy - rh//2:cy + rh//2, cx - rw//2:cx + rw//2]
         if roi.size == 0:
             return
 
-        try:
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-            # Red HSV masks (two ranges)
-            mask1 = cv2.inRange(hsv, (0, 100, 50), (10, 255, 255))
-            mask2 = cv2.inRange(hsv, (160, 100, 50), (179, 255, 255))
-            red_mask = cv2.bitwise_or(mask1, mask2)
+        # RED has TWO ranges in HSV
+        lower_red1 = np.array([0, 90, 60])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([160, 90, 60])
+        upper_red2 = np.array([179, 255, 255])
 
-            rows, cols = self.grid_rows, self.grid_cols
-            tile_h = max(1, roi.shape[0] // rows)
-            tile_w = max(1, roi.shape[1] // cols)
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        red_mask = mask1 | mask2
 
-            fractions = []
+        tile_h = roi.shape[0] // self.grid
+        tile_w = roi.shape[1] // self.grid
 
-            for r in range(rows):
-                for c in range(cols):
-                    sy = r * tile_h
-                    sx = c * tile_w
-                    ey = sy + tile_h if r < rows - 1 else roi.shape[0]
-                    ex = sx + tile_w if c < cols - 1 else roi.shape[1]
+        weighted_sum = 0.0
+        weight_total = 0.0
 
-                    tile = red_mask[sy:ey, sx:ex]
-                    if tile.size == 0:
-                        fractions.append(0.0)
-                        continue
+        for r in range(self.grid):
+            for c in range(self.grid):
+                y1 = r * tile_h
+                x1 = c * tile_w
+                tile = red_mask[y1:y1+tile_h, x1:x1+tile_w]
+                if tile.size == 0:
+                    continue
 
-                    red_pixels = int(np.count_nonzero(tile))
-                    frac = red_pixels / float(tile.size)
+                count = np.count_nonzero(tile)
+                if count < self.min_pixels:
+                    continue
 
-                    if red_pixels < self.per_tile_min_pixels:
-                        frac = 0.0
+                frac = count / tile.size
+                weight = 2.0 if (r == 1 and c == 1) else 1.0
+                weighted_sum += frac * weight
+                weight_total += weight
 
-                    fractions.append(frac)
+        avg = weighted_sum / max(weight_total, 1e-6)
+        detected = avg >= self.avg_thresh
 
-            avg_frac = float(np.mean(fractions))
-            detected = avg_frac >= self.avg_fraction_threshold
-
-        except Exception:
-            return
+        self.hit_count = self.hit_count + 1 if detected else 0
 
         out = Bool()
-        out.data = detected
+        out.data = self.hit_count >= self.required_hits
         self.pub.publish(out)
 
-        if detected:
-            self.get_logger().info(f'Red detected: avg_frac={avg_frac:.4f}')
 
+# ================= MOTION CONTROLLER =================
 
-# ============================================================
-# MOTION CONTROLLER
-# ============================================================
 class MotionController(Node):
     """
-    SCANNING -> CONFIRM -> APPROACHING -> ARRIVED_BLINK -> TURNING -> SCANNING
+    Turns → sees red → approaches → blinks → turns → repeats
     """
 
     def __init__(self):
@@ -140,124 +122,93 @@ class MotionController(Node):
 
         self.vehicle_name = os.getenv('VEHICLE_NAME', 'duckiebot').strip()
 
-        self.black_topic = f'/{self.vehicle_name}/black_detected'
-        self.range_topic = f'/{self.vehicle_name}/range'
-        self.wheels_topic = f'/{self.vehicle_name}/wheels_cmd'
-        self.led_topic = f'/{self.vehicle_name}/led_pattern'
+        self.create_subscription(Bool, f'/{self.vehicle_name}/red_detected', self.red_cb, 10)
+        self.create_subscription(Range, f'/{self.vehicle_name}/range', self.range_cb, 10)
 
-        self.distance_threshold = 0.06
-        self.loss_timeout = 0.35
-        self.confirm_stop = 0.18
-        self.scan_wheels = (1, 0.0)
-        self.forward_wheels = (0.5, 0.5)
-        self.turn_speed = 0.12
-        self.turn_duration = 1.6
-        self.control_rate_hz = 12.0
-        self.blink_interval = 0.4
+        self.wheels_pub = self.create_publisher(WheelsCmdStamped, f'/{self.vehicle_name}/wheels_cmd', 10)
+        self.led_pub = self.create_publisher(LEDPattern, f'/{self.vehicle_name}/led_pattern', 10)
+
+        # motion params (FASTER + STABLE)
+        self.scan_speed = (0.45, 0.0)
+        self.forward_speed = (0.28, 0.28)
+        self.turn_speed = 0.18
+
+        self.distance_threshold = 0.07
+        self.loss_timeout = 0.45
 
         self.state = 'SCANNING'
+        self.latest_red_time = None
         self.latest_range = None
-        self.last_black_time = None
-        self.confirm_end_time = None
-        self.arrived_start_time = None
-        self.turn_end_time = None
-        self.last_blink_time = 0.0
-        self.led_on = False
+        self.turn_end = None
+        self.blink_start = None
 
-        self.create_subscription(Bool, self.black_topic, self.black_callback, 10)
-        self.create_subscription(Range, self.range_topic, self.range_callback, 10)
-
-        self.wheels_pub = self.create_publisher(WheelsCmdStamped, self.wheels_topic, 10)
-        self.led_pub = self.create_publisher(LEDPattern, self.led_topic, 10)
-
-        self.create_timer(1.0 / self.control_rate_hz, self.control_loop)
-
+        self.create_timer(0.08, self.control_loop)
         self.get_logger().info('MotionController ready')
 
-    def black_callback(self, msg: Bool):
-        now = self.get_clock().now().nanoseconds / 1e9
-        if msg.data:
-            self.last_black_time = now
-            if self.state == 'SCANNING':
-                self.state = 'CONFIRM'
-                self.confirm_end_time = now + self.confirm_stop
+    def now(self):
+        return self.get_clock().now().nanoseconds / 1e9
 
-    def range_callback(self, msg: Range):
-        try:
-            self.latest_range = float(msg.range)
-        except Exception:
-            self.latest_range = None
+    def red_cb(self, msg: Bool):
+        if msg.data:
+            self.latest_red_time = self.now()
+            if self.state == 'SCANNING':
+                self.get_logger().info('Red detected → APPROACHING')
+                self.state = 'APPROACHING'
+
+    def range_cb(self, msg: Range):
+        self.latest_range = msg.range
 
     def control_loop(self):
-        now = self.get_clock().now().nanoseconds / 1e9
+        t = self.now()
 
         if self.state == 'SCANNING':
-            self.publish_wheels(*self.scan_wheels, 'scanning')
-
-        elif self.state == 'CONFIRM':
-            self.publish_wheels(0.0, 0.0, 'confirm')
-            if now >= self.confirm_end_time:
-                if self.last_black_time and now - self.last_black_time <= self.loss_timeout:
-                    self.state = 'APPROACHING'
-                else:
-                    self.state = 'SCANNING'
+            self.publish_wheels(*self.scan_speed)
 
         elif self.state == 'APPROACHING':
-            if not self.last_black_time or now - self.last_black_time > self.loss_timeout:
+            if self.latest_red_time is None or t - self.latest_red_time > self.loss_timeout:
                 self.state = 'SCANNING'
                 return
 
-            self.publish_wheels(*self.forward_wheels, 'approach')
+            self.publish_wheels(*self.forward_speed)
 
-            if self.latest_range and self.latest_range <= self.distance_threshold:
-                self.publish_wheels(0.0, 0.0, 'arrived')
-                self.state = 'ARRIVED_BLINK'
-                self.arrived_start_time = now
-                self.last_blink_time = now
-                self.led_on = False
+            if self.latest_range is not None and self.latest_range < self.distance_threshold:
+                self.get_logger().info('Arrived → BLINK')
+                self.publish_wheels(0.0, 0.0)
+                self.blink_start = t
+                self.state = 'BLINK'
 
-        elif self.state == 'ARRIVED_BLINK':
-            if now - self.last_blink_time >= self.blink_interval:
-                self.led_on = not self.led_on
-                self.publish_led(self.led_on)
-                self.last_blink_time = now
+        elif self.state == 'BLINK':
+            self.publish_led(int((t - self.blink_start) / 0.3) % 2 == 0)
 
-            if now - self.arrived_start_time >= 1.2:
-                self.turn_end_time = self.get_clock().now() + Duration(seconds=self.turn_duration)
-                self.state = 'TURNING'
+            if t - self.blink_start > 1.2:
                 self.publish_led(False)
+                self.turn_end = self.get_clock().now() + Duration(seconds=1.6)
+                self.state = 'TURNING'
 
         elif self.state == 'TURNING':
-            if self.get_clock().now() < self.turn_end_time:
-                self.publish_wheels(-self.turn_speed, self.turn_speed, 'turning')
+            if self.get_clock().now() < self.turn_end:
+                self.publish_wheels(-self.turn_speed, self.turn_speed)
             else:
-                self.publish_wheels(0.0, 0.0, 'done')
+                self.latest_red_time = None
                 self.state = 'SCANNING'
-                self.latest_range = None
-                self.last_black_time = None
 
-    def publish_wheels(self, vl, vr, frame):
+    def publish_wheels(self, l, r):
         msg = WheelsCmdStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = frame
-        msg.vel_left = vl
-        msg.vel_right = vr
+        msg.header.frame_id = 'cmd'
+        msg.vel_left = float(l)
+        msg.vel_right = float(r)
         self.wheels_pub.publish(msg)
 
     def publish_led(self, on):
         p = LEDPattern()
-        c = ColorRGBA()
-        if on:
-            c.r, c.g, c.b, c.a = 1.0, 1.0, 0.0, 1.0
-        else:
-            c.r, c.g, c.b, c.a = 0.0, 0.0, 0.0, 0.0
-        p.rgb_vals = [c] * 5
+        c = ColorRGBA(r=1.0 if on else 0.0, g=0.0, b=0.0, a=1.0 if on else 0.0)
+        p.rgb_vals = [c for _ in range(5)]
         self.led_pub.publish(p)
 
 
-# ============================================================
-# MAIN
-# ============================================================
+# ================= MAIN =================
+
 def main(args=None):
     rclpy.init(args=args)
 
@@ -273,12 +224,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            motion_node.publish_wheels(0.0, 0.0, 'shutdown')
-            motion_node.publish_led(False)
-        except Exception:
-            pass
-
+        motion_node.publish_wheels(0.0, 0.0)
+        motion_node.publish_led(False)
         executor.shutdown()
         image_node.destroy_node()
         motion_node.destroy_node()
