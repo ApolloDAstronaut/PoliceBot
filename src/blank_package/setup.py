@@ -10,12 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('lib/'+package_name,['blank_package/wheels.py']), #we added this line, add another if more nodes
-        ('lib/'+package_name,['blank_package/camera.py']),
-        ('lib/'+package_name,['blank_package/blinker.py']),
-        ('lib/'+package_name,['blank_package/compined_code.py']),
-        ('lib/'+package_name,['blank_package/publisher.py']),
-        ('lib/'+package_name,['blank_package/subscriber.py'])
+        ('lib/'+package_name,['blank_package/wheels.py'])
  ],
     install_requires=['setuptools'],
     zip_safe=True,
