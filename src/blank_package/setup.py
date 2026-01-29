@@ -12,7 +12,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('lib/'+package_name,['blank_package/wheels.py']), #we added this line, add another if more nodes
         ('lib/'+package_name,['blank_package/camera.py']),
-        ('lib/'+package_name,['blank_package/blinker.py'])
+        ('lib/'+package_name,['blank_package/camera.py'])
  ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -27,7 +27,10 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'blank_node = blank_package.blank_node:main'
+            'wheels = blank_package.wheels:main',
+            'blinker = blank_package.blinker:main',
+            'camera = blank_package.camera:main',
         ],
     },
+
 )
