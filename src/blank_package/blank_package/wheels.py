@@ -148,8 +148,8 @@ class MotionController(Node):
         self.distance_threshold = 0.06
         self.loss_timeout = 0.35
         self.confirm_stop = 0.18
-        self.scan_wheels = (0.35, 0.0)
-        self.forward_wheels = (0.16, 0.16)
+        self.scan_wheels = (1, 0.0)
+        self.forward_wheels = (0.5, 0.5)
         self.turn_speed = 0.12
         self.turn_duration = 1.6
         self.control_rate_hz = 12.0
