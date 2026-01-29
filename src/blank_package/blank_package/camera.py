@@ -15,7 +15,10 @@ import time
 
 
 class ImageColorDetector(Node):
-    """Detect small black region in center ROI and publish Bool when seen (low threshold)."""
+    """
+    Detect small black region using grid-averaged detection inside a center ROI.
+    Publishes Bool on /<vehicle>/black_detected when average-black fraction exceeds threshold.
+    """
 
     def __init__(self):
         super().__init__('image_color_detector')
@@ -28,14 +31,18 @@ class ImageColorDetector(Node):
 
         self.get_logger().info(f'ImageColorDetector subscribing: {img_topic}, publishing: {self.pub_topic}')
 
-        # tuned for low-res small-object detection
-        self.frame_skip = 4                         # check every 4th frame (adjust for CPU)
+        # parameters tuned for small-object detection
+        self.frame_skip = 4
         self.counter = 0
-        self.black_pixel_threshold_absolute = 40    # small absolute pixel count
-        self.black_pixel_threshold_fraction = 0.003 # small fraction of ROI area
+
+        # grid detection params
+        self.grid_rows = 3
+        self.grid_cols = 3
+        self.avg_fraction_threshold = 0.005    # average fraction across tiles to trigger (0.5%)
+        self.per_tile_min_pixels = 12          # tile must have at least this many black pixels to count (avoids noise)
 
     def image_callback(self, msg: CompressedImage):
-        # sample frames to reduce CPU load
+        # frame skip
         if self.counter % self.frame_skip != 0:
             self.counter += 1
             return
@@ -53,22 +60,43 @@ class ImageColorDetector(Node):
             return
 
         h, w = img.shape[:2]
-        # Center ROI (40% x 40%)
+        # center ROI (40% x 40%)
         rw, rh = int(w * 0.4), int(h * 0.4)
         cx, cy = w // 2, h // 2
         x1, y1 = max(0, cx - rw // 2), max(0, cy - rh // 2)
         x2, y2 = min(w, x1 + rw), min(h, y1 + rh)
         roi = img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return
 
-        # detect dark pixels in ROI using HSV V channel
         try:
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             v = hsv[:, :, 2]
-            black_mask = v < 50            # black threshold (V channel)
-            black_count = int(np.count_nonzero(black_mask))
-            roi_area = max(1, roi.shape[0] * roi.shape[1])
-            fractional_thresh = int(max(self.black_pixel_threshold_absolute, roi_area * self.black_pixel_threshold_fraction))
-            detected = black_count >= fractional_thresh
+            # create grid and compute per-tile black fraction
+            rows = self.grid_rows
+            cols = self.grid_cols
+            tile_h = max(1, roi.shape[0] // rows)
+            tile_w = max(1, roi.shape[1] // cols)
+            fractions = []
+            for r in range(rows):
+                for c in range(cols):
+                    sy = r * tile_h
+                    sx = c * tile_w
+                    ey = sy + tile_h if (r < rows - 1) else roi.shape[0]
+                    ex = sx + tile_w if (c < cols - 1) else roi.shape[1]
+                    tile_v = v[sy:ey, sx:ex]
+                    if tile_v.size == 0:
+                        fractions.append(0.0)
+                        continue
+                    black_mask = tile_v < 50
+                    black_count = int(np.count_nonzero(black_mask))
+                    frac = black_count / float(tile_v.size)
+                    # ignore tiny counts that are likely noise
+                    if black_count < self.per_tile_min_pixels:
+                        frac = 0.0
+                    fractions.append(frac)
+            avg_frac = float(np.mean(fractions))
+            detected = avg_frac >= self.avg_fraction_threshold
         except Exception:
             return
 
@@ -77,14 +105,15 @@ class ImageColorDetector(Node):
         self.pub.publish(out)
 
         if detected:
-            self.get_logger().info(f'Black detected (count={black_count}, thresh={fractional_thresh})')
+            self.get_logger().info(f'Black detected: avg_frac={avg_frac:.4f}')
+
 
 
 class MotionController(Node):
     """
-    SCANNING -> when black detected -> APPROACHING (all wheels forward)
-    -> when range <= threshold -> ARRIVED_BLINK (stop + blink LEDs) -> TURNING (slow)
-    -> back to SCANNING. Repeats until Ctrl+C.
+    SCANNING -> CONFIRM (short stop) -> APPROACHING (all wheels forward, monitor image)
+    -> ARRIVED_BLINK -> TURNING -> SCANNING
+    If black disappears while APPROACHING (loss_timeout), go back to SCANNING.
     """
 
     def __init__(self):
@@ -96,40 +125,50 @@ class MotionController(Node):
         self.wheels_topic = f'/{self.vehicle_name}/wheels_cmd'
         self.led_topic = f'/{self.vehicle_name}/led_pattern'
 
-        # parameters (tweak as needed)
-        self.distance_threshold = 0.06       # meters to consider "arrived" (close)
-        self.hysteresis = 0.12               # object must move away this much to resume scanning
-        self.scan_wheels = (0.4, 0.0)        # single-wheel turn for scanning
-        self.forward_wheels = (0.18, 0.18)   # slow forward approach (all wheels)
-        self.turn_speed = 0.12               # slow rotation speed (in-place)
-        self.turn_duration = 1.8             # seconds of slow turn after arrival
-        self.control_rate_hz = 10.0
-        self.blink_interval = 0.4            # seconds
+        # params
+        self.distance_threshold = 0.06     # meters to consider "arrived"
+        self.loss_timeout = 0.35           # seconds: if no black seen for this long while approaching -> abort
+        self.confirm_stop = 0.18          # seconds to stop and confirm before starting approach
+        self.scan_wheels = (0.35, 0.0)    # single-wheel turn for scanning
+        self.forward_wheels = (0.16, 0.16) # slow forward approach
+        self.turn_speed = 0.12
+        self.turn_duration = 1.6
+        self.control_rate_hz = 12.0
+        self.blink_interval = 0.4
 
         # state
-        self.state = 'SCANNING'  # SCANNING -> APPROACHING -> ARRIVED_BLINK -> TURNING
+        self.state = 'SCANNING'
         self.latest_range = None
+        self.latest_black = False
+        self.last_black_time = None
+        self.confirm_end_time = None
+        self.arrived_start_time = None
+        self.turn_end_time = None
         self.last_blink_time = 0.0
         self.led_on = False
-        self.turn_end_time = None
 
-        # subs/pubs
+        # pubs/subs
         self.create_subscription(Bool, self.black_topic, self.black_callback, 10)
         self.create_subscription(Range, self.range_topic, self.range_callback, 10)
         self.wheels_pub = self.create_publisher(WheelsCmdStamped, self.wheels_topic, 10)
         self.led_pub = self.create_publisher(LEDPattern, self.led_topic, 10)
 
-        # control timer
-        timer_period = 1.0 / float(self.control_rate_hz)
-        self.create_timer(timer_period, self.control_loop)
-
+        self.create_timer(1.0 / float(self.control_rate_hz), self.control_loop)
         self.get_logger().info(f'MotionController ready: black={self.black_topic}, range={self.range_topic}')
 
     def black_callback(self, msg: Bool):
-        # require detection only when scanning
-        if msg.data and self.state == 'SCANNING':
-            self.get_logger().info('Black detected -> switching to APPROACHING')
-            self.state = 'APPROACHING'
+        now = self.get_clock().now().nanoseconds / 1e9
+        if msg.data:
+            self.latest_black = True
+            self.last_black_time = now
+            # trigger confirm if scanning
+            if self.state == 'SCANNING':
+                self.get_logger().info('Black seen -> entering CONFIRM state')
+                self.state = 'CONFIRM'
+                self.confirm_end_time = now + self.confirm_stop
+        else:
+            # do not immediately clear latest_black, keep timestamp for loss handling
+            self.latest_black = False
 
     def range_callback(self, msg: Range):
         try:
@@ -138,24 +177,43 @@ class MotionController(Node):
             self.latest_range = None
 
     def control_loop(self):
-        now = self.get_clock().now().nanoseconds / 1e9  # seconds in float
+        now = self.get_clock().now().nanoseconds / 1e9
 
         if self.state == 'SCANNING':
-            # rotate slowly by running one wheel forward
-            self.publish_wheels(self.scan_wheels[0], self.scan_wheels[1], frame_id='scanning')
+            # rotate to scan
+            self.publish_wheels(*self.scan_wheels, frame_id='scanning')
+
+        elif self.state == 'CONFIRM':
+            # stop during confirmation window
+            self.publish_wheels(0.0, 0.0, frame_id='confirm_stop')
+            if self.confirm_end_time is not None and now >= self.confirm_end_time:
+                # if recent black seen, go to APPROACHING, otherwise resume scanning
+                if self.last_black_time is not None and (now - self.last_black_time) <= (self.loss_timeout):
+                    self.get_logger().info('Confirm passed -> APPROACHING')
+                    self.state = 'APPROACHING'
+                else:
+                    self.get_logger().info('Confirm failed -> resume SCANNING')
+                    self.state = 'SCANNING'
+                self.confirm_end_time = None
 
         elif self.state == 'APPROACHING':
-            # move forward with all wheels
-            self.publish_wheels(self.forward_wheels[0], self.forward_wheels[1], frame_id='approach')
+            # If black has not been seen recently, abort and resume scanning
+            if self.last_black_time is None or (now - self.last_black_time) > self.loss_timeout:
+                self.get_logger().info('Lost black while approaching -> resume SCANNING')
+                self.state = 'SCANNING'
+                return
 
-            # if close enough -> stop & blink then turn slowly
+            # move forward
+            self.publish_wheels(*self.forward_wheels, frame_id='approach')
+
+            # check distance
             if self.latest_range is not None and self.latest_range <= self.distance_threshold:
                 self.publish_wheels(0.0, 0.0, frame_id='arrived')
                 self.get_logger().info(f'Arrived (range={self.latest_range:.3f}) -> blinking then turning slowly')
                 self.state = 'ARRIVED_BLINK'
+                self.arrived_start_time = now
                 self.last_blink_time = now
                 self.led_on = False
-                # ensure LED off initially
                 self.publish_led(False)
 
         elif self.state == 'ARRIVED_BLINK':
@@ -165,37 +223,27 @@ class MotionController(Node):
                 self.publish_led(self.led_on)
                 self.last_blink_time = now
 
-            # after blinking a short time, start slow turn
-            # we use a simple rule: blink for ~1.2s (3 cycles) then start turning
-            # track total blink time by counting alternating events
-            # We'll start turn after 1.2 seconds from first blink
-            # Use last_blink_time stored; compute elapsed since entered ARRIVED_BLINK via a small attribute
-            if not hasattr(self, '_arrived_start_time'):
-                self._arrived_start_time = now
-            if now - self._arrived_start_time >= 1.2:
-                # prepare turn
-                self._arrived_start_time = None
+            # after short blink period, start turning
+            if self.arrived_start_time is not None and (now - self.arrived_start_time) >= 1.2:
+                self.arrived_start_time = None
                 self.turn_end_time = self.get_clock().now() + Duration(seconds=self.turn_duration)
                 self.state = 'TURNING'
-                # ensure leds off during turn
                 self.publish_led(False)
 
         elif self.state == 'TURNING':
-            # rotate in place slowly (left negative, right positive)
             if self.turn_end_time is not None and self.get_clock().now() < self.turn_end_time:
                 self.publish_wheels(-self.turn_speed, self.turn_speed, frame_id='turning')
             else:
-                # finish turn, go back to scanning
                 self.publish_wheels(0.0, 0.0, frame_id='stop_after_turn')
-                self.get_logger().info('Turn complete -> resuming SCANNING')
-                # clear state and resume scanning
+                self.get_logger().info('Turn complete -> resume SCANNING')
                 self.turn_end_time = None
                 self.state = 'SCANNING'
-                # clear any stale range
+                # clear range and black history so we re-detect
                 self.latest_range = None
+                self.latest_black = False
+                self.last_black_time = None
 
         else:
-            # default: ensure stopped
             self.publish_wheels(0.0, 0.0, frame_id='stopped')
 
     def publish_wheels(self, vel_left: float, vel_right: float, frame_id: str = 'cmd'):
@@ -228,10 +276,8 @@ class MotionController(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-
     image_node = ImageColorDetector()
     motion_node = MotionController()
-
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(image_node)
     executor.add_node(motion_node)
@@ -241,7 +287,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        # stop wheels and turn leds off
+        # ensure stopped + leds off
         try:
             motion_node.publish_wheels(0.0, 0.0, frame_id='shutdown')
             motion_node.publish_led(False)
